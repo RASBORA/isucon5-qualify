@@ -3,6 +3,7 @@
 import os
 import bottle
 import pymysql
+import functools
 
 
 app = bottle.default_app()
@@ -18,12 +19,12 @@ app.config.load_dict({
 })
 
 
-PREFECTURES = [
+PREFECTURES = (
     "未入力",
     "北海道", "青森県", "岩手県", "宮城県", "秋田県", "山形県", "福島県", "茨城県", "栃木県", "群馬県", "埼玉県", "千葉県", "東京都", "神奈川県", "新潟県", "富山県",
     "石川県", "福井県", "山梨県", "長野県", "岐阜県", "静岡県", "愛知県", "三重県", "滋賀県", "京都府", "大阪府", "兵庫県", "奈良県", "和歌山県", "鳥取県", "島根県",
     "岡山県", "広島県", "山口県", "徳島県", "香川県", "愛媛県", "高知県", "福岡県", "佐賀県", "長崎県", "熊本県", "大分県", "宮崎県", "鹿児島県", "沖縄県",
-]
+)
 
 
 def abort_authentication_error():
@@ -91,10 +92,10 @@ def db_execute(query, *args):
 
 
 def authenticate(email, password):
-    query = "SELECT u.id AS id, u.account_name AS account_name, " \
-            " u.nick_name AS nick_name, u.email AS email " \
-            "FROM users u JOIN salts s ON u.id = s.user_id " \
-            "WHERE u.email = %s AND u.passhash = SHA2(CONCAT(%s, s.salt), 512)"
+    query = """SELECT u.id AS id, u.account_name AS account_name,
+             u.nick_name AS nick_name, u.email AS email
+            FROM users u JOIN salts s ON u.id = s.user_id 
+            WHERE u.email = %s AND u.passhash = SHA2(CONCAT(%s, s.salt), 512)"""
     result = db_fetchone(query, email, password)
     if not result:
         abort_authentication_error()
@@ -142,7 +143,8 @@ def is_friend(another_id):
     user_id = get_session_user_id()
     if not user_id:
         return False
-    query = "SELECT COUNT(1) AS cnt FROM relations WHERE (one = %s AND another = %s) OR (one = %s AND another = %s)"
+
+    query = "SELECT COUNT(1) AS cnt FROM relations WHERE one = (%s,%s) AND another = (%s,%s)"
     result = db_fetchone(query, user_id, another_id, another_id, user_id)
     return result and result["cnt"] > 0
 
@@ -183,22 +185,24 @@ def get_logout():
 
 @app.get("/")
 def get_index():
-    authenticated()
-    
-    profile = db_fetchone("SELECT * FROM profiles WHERE user_id = %s", current_user()["id"])
-    
+    current_user_id = current_user()["id"]
+    if not current_user_id:
+        bottle.redirect("/login", 302)
+
+    profile = db_fetchone("SELECT * FROM profiles WHERE user_id = %s", current_user_id)
+
     query = "SELECT * FROM entries WHERE user_id = %s ORDER BY created_at LIMIT 5"
-    entries = db_fetchall(query, current_user()["id"])
+    entries = db_fetchall(query, current_user_id)
     for entry in entries:
         entry["is_private"] = entry["private"] == 1
         entry["title"], entry["content"] = entry["body"].split("\n", 1)
-    
-    comments_for_me_query = "SELECT c.id AS id, c.entry_id AS entry_id, c.user_id AS user_id, " \
-                            " c.comment AS comment, c.created_at AS created_at " \
-                            "FROM comments c JOIN entries e ON c.entry_id = e.id " \
-                            "WHERE e.user_id = %s ORDER BY c.created_at DESC LIMIT 10"
-    comments_for_me = db_fetchall(comments_for_me_query, current_user()["id"])
-    
+
+    comments_for_me_query = """SELECT c.id AS id, c.entry_id AS entry_id, c.user_id AS user_id,
+                             c.comment AS comment, c.created_at AS created_at
+                            FROM comments c JOIN entries e ON c.entry_id = e.id
+                            WHERE e.user_id = %s ORDER BY c.created_at DESC LIMIT 10"""
+    comments_for_me = db_fetchall(comments_for_me_query, current_user_id)
+
     entries_of_friends = []
     with db().cursor() as cursor:
         cursor.execute("SELECT * FROM entries ORDER BY created_at DESC LIMIT 1000")
@@ -209,7 +213,7 @@ def get_index():
             entries_of_friends.append(entry)
             if len(entries_of_friends) >= 10:
                 break
-    
+
     comments_of_friends = []
     with db().cursor() as cursor:
         cursor.execute("SELECT * FROM comments ORDER BY created_at DESC LIMIT 1000")
@@ -223,24 +227,24 @@ def get_index():
             comments_of_friends.append(comment)
             if len(comments_of_friends) >= 10:
                 break
-    
+
     friends_map = {}
     with db().cursor() as cursor:
         cursor.execute("SELECT * FROM relations WHERE one = %s OR another = %s ORDER BY created_at DESC",
-                       args=(current_user()["id"], current_user()["id"]))
+                       args=(current_user_id, current_user_id))
         for relation in cursor:
-            key = "another" if relation["one"] == current_user()["id"] else "one"
+            key = "another" if relation["one"] == current_user_id else "one"
             friends_map.setdefault(relation[key], relation["created_at"])
-    friends = list(friends_map.items())
-    
+    friends = friends_map.items()
+
     query = "SELECT user_id, owner_id, DATE(created_at) AS date, MAX(created_at) AS updated " \
             "FROM footprints " \
             "WHERE user_id = %s " \
             "GROUP BY user_id, owner_id, DATE(created_at) " \
             "ORDER BY updated DESC " \
             "LIMIT 10"
-    footprints = db_fetchall(query, current_user()["id"])
-    
+    footprints = db_fetchall(query, current_user_id)
+
     return bottle.template("index", {
       "owner": current_user(),
       "profile": profile or {},
@@ -255,7 +259,10 @@ def get_index():
 
 @app.get("/profile/<account_name>")
 def get_profile(account_name):
-    authenticated()
+    current_user_id = current_user()["id"]
+    if not current_user_id:
+        bottle.redirect("/login", 302)
+
     owner = user_from_account(account_name)
     prof = db_fetchone("SELECT * FROM profiles WHERE user_id = %s", owner["id"])
     prof = prof or {}
@@ -278,7 +285,10 @@ def get_profile(account_name):
 
 @app.post("/profile/<account_name>")
 def post_profile(account_name):
-    authenticated()
+    current_user_id = current_user()["id"]
+    if not current_user_id:
+        bottle.redirect("/login", 302)
+
     if account_name != current_user()["account_name"]:
         abort_permission_denied()
     args = [bottle.request.forms.getunicode("first_name"),
@@ -301,7 +311,10 @@ def post_profile(account_name):
 
 @app.get("/diary/entries/<account_name>")
 def get_entries(account_name):
-    authenticated()
+    current_user_id = current_user()["id"]
+    if not current_user_id:
+        bottle.redirect("/login", 302)
+
     owner = user_from_account(account_name)
     if permitted(owner["id"]):
       query = "SELECT * FROM entries WHERE user_id = %s ORDER BY created_at DESC LIMIT 20"
@@ -314,14 +327,17 @@ def get_entries(account_name):
     mark_footprint(owner["id"])
     return bottle.template("entries", {
         "owner": get_user(owner["id"]),
-        "entries": entries, 
+        "entries": entries,
         "myself": current_user()["id"] == owner["id"],
     })
 
 
 @app.get("/diary/entry/<entry_id>")
 def get_entry(entry_id):
-    authenticated()
+    current_user_id = current_user()["id"]
+    if not current_user_id:
+        bottle.redirect("/login", 302)
+
     entry = db_fetchone("SELECT * FROM entries WHERE id = %s", int(entry_id))
     if not entry:
         abort_content_not_found()
@@ -337,7 +353,10 @@ def get_entry(entry_id):
 
 @app.post("/diary/entry")
 def post_entry():
-    authenticated()
+    current_user_id = current_user()["id"]
+    if not current_user_id:
+        bottle.redirect("/login", 302)
+
     query = "INSERT INTO entries (user_id, private, body) VALUES (%s, %s, %s)"
     body = (bottle.request.forms.getunicode("title", "") or "タイトルなし") + "\n" + bottle.request.forms.getunicode("content", "")
     db_execute(query,
@@ -349,7 +368,10 @@ def post_entry():
 
 @app.post("/diary/comment/<entry_id>")
 def post_comment(entry_id):
-    authenticated()
+    current_user_id = current_user()["id"]
+    if not current_user_id:
+        bottle.redirect("/login", 302)
+
     entry = db_fetchone("SELECT * FROM entries WHERE id = %s", int(entry_id))
     if not entry:
         abort_content_not_found()
@@ -363,7 +385,10 @@ def post_comment(entry_id):
 
 @app.get("/footprints")
 def get_footprints():
-    authenticated()
+    current_user_id = current_user()["id"]
+    if not current_user_id:
+        bottle.redirect("/login", 302)
+
     query = "SELECT user_id, owner_id, DATE(created_at) AS date, MAX(created_at) AS updated " \
             "FROM footprints " \
             "WHERE user_id = %s " \
@@ -376,9 +401,12 @@ def get_footprints():
 
 @app.get("/friends")
 def get_friends():
-    authenticated()
+    current_user_id = current_user()["id"]
+    if not current_user_id:
+        bottle.redirect("/login", 302)
+
     query = "SELECT * FROM relations WHERE one = %s OR another = %s ORDER BY created_at DESC"
-    relations = db_fetchall(query, current_user()["id"], current_user()["id"])
+    relations = db_fetchall(query, current_user()["id"], current_user_id)
     friends_map = {}
     for relation in relations:
         key = "another" if relation["one"] == current_user()["id"] else "one"
@@ -389,13 +417,17 @@ def get_friends():
 
 @app.post("/friends/<account_name>")
 def post_friends(account_name):
-    authenticated()
+    current_user_id = current_user()["id"]
+    if not current_user_id:
+        bottle.redirect("/login", 302)
+
     if not is_friend_account(account_name):
         user = user_from_account(account_name)
         db_execute("INSERT INTO relations (one, another) VALUES (%s, %s), (%s, %s)",
                    current_user()["id"], user["id"], user["id"], current_user()["id"])
     bottle.redirect("/friends", 303)
 
+## ---------------- ファイル系 ------------------- ##
 
 @app.get("/css/<filename:path>")
 def get_css(filename):
@@ -411,7 +443,7 @@ def get_fonts(filename):
 def get_js(filename):
     return get_static("js", filename)
 
-
+@functools.lru_cache(maxsize = None)
 def get_static(dirname, filename):
     basedir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     staticdir = os.path.join(basedir, "static", dirname)
